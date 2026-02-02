@@ -11,6 +11,7 @@ from project_yield.config import Settings, get_settings
 from project_yield.data.ingestion import DataIngestion
 from project_yield.data.reader import DataReader
 from project_yield.data.writer import ParquetWriter
+from project_yield.visualization.charts import ChartBuilder
 
 
 class ProjectYield:
@@ -45,6 +46,7 @@ class ProjectYield:
         self._calculator = RatioCalculator(self.settings)
         self._metrics = MetricsEngine(self.settings)
         self._ingestion = DataIngestion(self.settings)
+        self._charts = ChartBuilder(self.settings)
 
     # --- Data Management ---
 
@@ -262,3 +264,8 @@ class ProjectYield:
     def metrics(self) -> MetricsEngine:
         """Access the MetricsEngine for batch operations."""
         return self._metrics
+
+    @property
+    def charts(self) -> ChartBuilder:
+        """Access the ChartBuilder for visualizations."""
+        return self._charts
