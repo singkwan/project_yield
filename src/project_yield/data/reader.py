@@ -20,6 +20,10 @@ class DataReader:
         """Get glob pattern for all Parquet files under a base path."""
         return str(base_path / "**" / "*.parquet")
 
+    def _has_parquet_files(self, base_path: Path) -> bool:
+        """Check if any parquet files exist under the base path."""
+        return any(base_path.glob("**/*.parquet"))
+
     def get_prices(
         self,
         ticker: str | None = None,
@@ -41,13 +45,11 @@ class DataReader:
         Returns:
             LazyFrame with price data
         """
-        pattern = self._get_parquet_pattern(self.settings.prices_path)
-
-        try:
-            lf = pl.scan_parquet(pattern)
-        except Exception as e:
-            logger.warning(f"No price data found: {e}")
+        if not self._has_parquet_files(self.settings.prices_path):
             return pl.LazyFrame()
+
+        pattern = self._get_parquet_pattern(self.settings.prices_path)
+        lf = pl.scan_parquet(pattern)
 
         # Apply filters
         if ticker is not None:
@@ -82,13 +84,11 @@ class DataReader:
         Returns:
             LazyFrame with quarterly fundamentals
         """
-        pattern = self._get_parquet_pattern(self.settings.fundamentals_quarterly_path)
-
-        try:
-            lf = pl.scan_parquet(pattern)
-        except Exception as e:
-            logger.warning(f"No quarterly fundamentals found: {e}")
+        if not self._has_parquet_files(self.settings.fundamentals_quarterly_path):
             return pl.LazyFrame()
+
+        pattern = self._get_parquet_pattern(self.settings.fundamentals_quarterly_path)
+        lf = pl.scan_parquet(pattern)
 
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
@@ -115,13 +115,11 @@ class DataReader:
         Returns:
             LazyFrame with annual fundamentals
         """
-        pattern = self._get_parquet_pattern(self.settings.fundamentals_annual_path)
-
-        try:
-            lf = pl.scan_parquet(pattern)
-        except Exception as e:
-            logger.warning(f"No annual fundamentals found: {e}")
+        if not self._has_parquet_files(self.settings.fundamentals_annual_path):
             return pl.LazyFrame()
+
+        pattern = self._get_parquet_pattern(self.settings.fundamentals_annual_path)
+        lf = pl.scan_parquet(pattern)
 
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
