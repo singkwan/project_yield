@@ -67,9 +67,9 @@ class APIValidator:
         """Initialize validator with settings."""
         self.settings = settings or get_settings()
         self._configure_simfin()
-        self._prices_df = None  # Cache for price data
-        self._income_df = None  # Cache for income data
-        self._cashflow_df = None  # Cache for cashflow data
+        self._prices_pdf = None  # Cache for price data (pandas)
+        self._income_pdf = None  # Cache for income data (pandas)
+        self._cashflow_pdf = None  # Cache for cashflow data (pandas)
 
     def _configure_simfin(self) -> None:
         """Configure SimFin with API key."""
@@ -118,8 +118,8 @@ class APIValidator:
         """Validate that the API key works."""
         try:
             # Try to fetch company list to verify API key
-            df = sf.load_companies(market="us")
-            count = len(df) if df is not None else 0
+            pdf = sf.load_companies(market="us")
+            count = len(pdf) if pdf is not None else 0
 
             if count > 0:
                 return ValidationResult(
@@ -145,9 +145,9 @@ class APIValidator:
         """Check how many S&P 500 companies are available."""
         try:
             # Load all US companies - Ticker is the index
-            df = sf.load_companies(market="us")
+            pdf = sf.load_companies(market="us")
 
-            if df is None or len(df) == 0:
+            if pdf is None or len(pdf) == 0:
                 return ValidationResult(
                     name="S&P 500 Coverage",
                     passed=False,
@@ -155,7 +155,7 @@ class APIValidator:
                 )
 
             # Ticker is the index in simfin
-            tickers = set(df.index.tolist())
+            tickers = set(pdf.index.tolist())
 
             # Check sample S&P 500 tickers
             found = [t for t in self.SAMPLE_TICKERS if t in tickers]
@@ -191,10 +191,10 @@ class APIValidator:
         try:
             # Load daily share prices (all tickers) - use cached data if available
             logger.info("Loading share prices (variant=daily)...")
-            df = sf.load_shareprices(market="us", variant="daily", refresh_days=9999)
-            self._prices_df = df  # Cache for later use
+            pdf = sf.load_shareprices(market="us", variant="daily", refresh_days=9999)
+            self._prices_pdf = pdf  # Cache for later use
 
-            if df is None or len(df) == 0:
+            if pdf is None or len(pdf) == 0:
                 return ValidationResult(
                     name="Price Data",
                     passed=False,
@@ -202,8 +202,8 @@ class APIValidator:
                 )
 
             # Get unique tickers and date range
-            tickers = df.index.get_level_values("Ticker").unique()
-            dates = df.index.get_level_values("Date")
+            tickers = pdf.index.get_level_values("Ticker").unique()
+            dates = pdf.index.get_level_values("Date")
             min_date = dates.min()
             max_date = dates.max()
 
@@ -212,10 +212,10 @@ class APIValidator:
             aapl_min = None
             aapl_max = None
             if "AAPL" in tickers:
-                aapl = df.loc["AAPL"]
-                aapl_rows = len(aapl)
-                aapl_min = aapl.index.min()
-                aapl_max = aapl.index.max()
+                aapl_pdf = pdf.loc["AAPL"]
+                aapl_rows = len(aapl_pdf)
+                aapl_min = aapl_pdf.index.min()
+                aapl_max = aapl_pdf.index.max()
 
             # Check if we have data from 2020 onwards
             has_historical = min_date.date() <= date(2020, 6, 1) if min_date else False
@@ -223,15 +223,15 @@ class APIValidator:
             return ValidationResult(
                 name="Price Data",
                 passed=has_historical,
-                message=f"Price data: {len(df):,} rows, {len(tickers):,} tickers",
+                message=f"Price data: {len(pdf):,} rows, {len(tickers):,} tickers",
                 details={
-                    "total_rows": len(df),
+                    "total_rows": len(pdf),
                     "unique_tickers": len(tickers),
                     "min_date": str(min_date.date() if min_date else None),
                     "max_date": str(max_date.date() if max_date else None),
                     "aapl_rows": aapl_rows,
                     "aapl_date_range": f"{aapl_min} to {aapl_max}" if aapl_min else None,
-                    "columns": list(df.columns),
+                    "columns": list(pdf.columns),
                 },
             )
         except Exception as e:
@@ -246,10 +246,10 @@ class APIValidator:
         try:
             # Load quarterly income statements (all tickers)
             logger.info("Loading income statements (variant=quarterly)...")
-            df = sf.load_income(market="us", variant="quarterly", refresh_days=9999)
-            self._income_df = df  # Cache for later use
+            pdf = sf.load_income(market="us", variant="quarterly", refresh_days=9999)
+            self._income_pdf = pdf  # Cache for later use
 
-            if df is None or len(df) == 0:
+            if pdf is None or len(pdf) == 0:
                 return ValidationResult(
                     name="Fundamentals Data",
                     passed=False,
@@ -257,28 +257,28 @@ class APIValidator:
                 )
 
             # Get unique tickers
-            tickers = df.index.get_level_values("Ticker").unique()
+            tickers = pdf.index.get_level_values("Ticker").unique()
 
             # Check for key columns
             expected_cols = ["Revenue", "Net Income", "Gross Profit", "Operating Income"]
-            found_cols = [c for c in expected_cols if c in df.columns]
+            found_cols = [c for c in expected_cols if c in pdf.columns]
 
             # Check AAPL specifically
             aapl_rows = 0
             if "AAPL" in tickers:
-                aapl = df.loc["AAPL"]
-                aapl_rows = len(aapl)
+                aapl_pdf = pdf.loc["AAPL"]
+                aapl_rows = len(aapl_pdf)
 
             return ValidationResult(
                 name="Fundamentals Data",
                 passed=len(found_cols) >= 2,
-                message=f"Fundamentals: {len(df):,} rows, {len(tickers):,} tickers",
+                message=f"Fundamentals: {len(pdf):,} rows, {len(tickers):,} tickers",
                 details={
-                    "total_rows": len(df),
+                    "total_rows": len(pdf),
                     "unique_tickers": len(tickers),
                     "aapl_quarters": aapl_rows,
                     "key_columns_found": found_cols,
-                    "all_columns": list(df.columns)[:15],
+                    "all_columns": list(pdf.columns)[:15],
                 },
             )
         except Exception as e:
@@ -293,29 +293,29 @@ class APIValidator:
         try:
             results = {}
 
-            # Use cached data
-            prices_df = self._prices_df
-            income_df = self._income_df
+            # Use cached data (pandas DataFrames)
+            prices_pdf = self._prices_pdf
+            income_pdf = self._income_pdf
 
-            if prices_df is None or income_df is None:
+            if prices_pdf is None or income_pdf is None:
                 return ValidationResult(
                     name="Data Completeness",
                     passed=False,
                     message="Price or income data not loaded",
                 )
 
-            price_tickers = set(prices_df.index.get_level_values("Ticker").unique())
-            income_tickers = set(income_df.index.get_level_values("Ticker").unique())
+            price_tickers = set(prices_pdf.index.get_level_values("Ticker").unique())
+            income_tickers = set(income_pdf.index.get_level_values("Ticker").unique())
 
             for ticker in self.SAMPLE_TICKERS:
                 price_rows = 0
                 income_rows = 0
 
                 if ticker in price_tickers:
-                    price_rows = len(prices_df.loc[ticker])
+                    price_rows = len(prices_pdf.loc[ticker])
 
                 if ticker in income_tickers:
-                    income_rows = len(income_df.loc[ticker])
+                    income_rows = len(income_pdf.loc[ticker])
 
                 results[ticker] = {
                     "prices": price_rows,
@@ -343,25 +343,25 @@ class APIValidator:
         try:
             # Load cash flow statements
             logger.info("Loading cash flow statements (variant=quarterly)...")
-            cf = sf.load_cashflow(market="us", variant="quarterly", refresh_days=9999)
-            self._cashflow_df = cf
+            cf_pdf = sf.load_cashflow(market="us", variant="quarterly", refresh_days=9999)
+            self._cashflow_pdf = cf_pdf
 
-            # Use cached income data
-            income = self._income_df
+            # Use cached income data (pandas)
+            income_pdf = self._income_pdf
 
             capex_available = False
             rd_available = False
             capex_cols = []
             rd_cols = []
 
-            if cf is not None:
+            if cf_pdf is not None:
                 # CapEx is in cash flow statement as "Change in Fixed Assets & Intangibles"
-                capex_cols = [c for c in cf.columns if "fixed assets" in c.lower() or "capex" in c.lower()]
+                capex_cols = [c for c in cf_pdf.columns if "fixed assets" in c.lower() or "capex" in c.lower()]
                 capex_available = len(capex_cols) > 0
 
-            if income is not None:
+            if income_pdf is not None:
                 # R&D might be in income statement
-                rd_cols = [c for c in income.columns if "r&d" in c.lower() or "research" in c.lower()]
+                rd_cols = [c for c in income_pdf.columns if "r&d" in c.lower() or "research" in c.lower()]
                 rd_available = len(rd_cols) > 0
 
             return ValidationResult(
@@ -373,7 +373,7 @@ class APIValidator:
                     "capex_columns": capex_cols,
                     "rd_available": rd_available,
                     "rd_columns": rd_cols,
-                    "cashflow_columns": list(cf.columns)[:20] if cf is not None else [],
+                    "cashflow_columns": list(cf_pdf.columns)[:20] if cf_pdf is not None else [],
                 },
             )
         except Exception as e:
