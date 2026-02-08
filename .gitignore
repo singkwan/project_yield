@@ -61,14 +61,8 @@ htmlcov/
 dmypy.json
 .pytype/
 
-# Data directories
-data/raw/*
-data/processed/*.duckdb
-data/processed/*.duckdb.wal
-data/cache/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-!data/cache/.gitkeep
+# Data directories (all data is generated via ingestion pipeline)
+data/
 
 # Logs
 logs/*.log
