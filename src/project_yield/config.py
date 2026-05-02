@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # SimFin API
     simfin_api_key: str = Field(description="SimFin API key for financial data")
 
-    # Data Storage
+    # Data Storage  
     data_path: Path = Field(default=Path("data"), description="Root path for data storage")
 
     # Logging

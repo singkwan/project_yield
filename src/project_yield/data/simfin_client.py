@@ -284,7 +284,8 @@ class SimFinClient:
 
         # Join balance sheet (exclude duplicate columns)
         if not balance.is_empty():
-            balance_cols = [c for c in balance.columns if c not in income.columns or c in join_cols]
+            # need this logic to remove duplicates since each table has duplicates
+            balance_cols = [c for c in balance.columns if c not in income.columns or c in join_cols] 
             df = df.join(
                 balance.select(balance_cols),
                 on=join_cols,

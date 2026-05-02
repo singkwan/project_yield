@@ -24,6 +24,24 @@ class DataReader:
         """Check if any parquet files exist under the base path."""
         return any(base_path.glob("**/*.parquet"))
 
+    def _get_base_path(self, data_type: str) -> Path:
+        """Map data type name to its base path."""
+        paths = {
+            "prices": self.settings.prices_path,
+            "quarterly": self.settings.fundamentals_quarterly_path,
+            "annual": self.settings.fundamentals_annual_path,
+        }
+        if data_type not in paths:
+            raise ValueError(f"Unknown data_type: {data_type}")
+        return paths[data_type]
+
+    def _scan_parquet(self, base_path: Path) -> pl.LazyFrame:
+        """Scan parquet files under a base path, returning empty LazyFrame if none exist."""
+        if not self._has_parquet_files(base_path):
+            return pl.LazyFrame()
+        pattern = self._get_parquet_pattern(base_path)
+        return pl.scan_parquet(pattern)
+
     def get_prices(
         self,
         ticker: str | None = None,
@@ -45,11 +63,7 @@ class DataReader:
         Returns:
             LazyFrame with price data
         """
-        if not self._has_parquet_files(self.settings.prices_path):
-            return pl.LazyFrame()
-
-        pattern = self._get_parquet_pattern(self.settings.prices_path)
-        lf = pl.scan_parquet(pattern)
+        lf = self._scan_parquet(self.settings.prices_path)
 
         # Apply filters
         if ticker is not None:
@@ -84,11 +98,7 @@ class DataReader:
         Returns:
             LazyFrame with quarterly fundamentals
         """
-        if not self._has_parquet_files(self.settings.fundamentals_quarterly_path):
-            return pl.LazyFrame()
-
-        pattern = self._get_parquet_pattern(self.settings.fundamentals_quarterly_path)
-        lf = pl.scan_parquet(pattern)
+        lf = self._scan_parquet(self.settings.fundamentals_quarterly_path)
 
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
@@ -115,11 +125,7 @@ class DataReader:
         Returns:
             LazyFrame with annual fundamentals
         """
-        if not self._has_parquet_files(self.settings.fundamentals_annual_path):
-            return pl.LazyFrame()
-
-        pattern = self._get_parquet_pattern(self.settings.fundamentals_annual_path)
-        lf = pl.scan_parquet(pattern)
+        lf = self._scan_parquet(self.settings.fundamentals_annual_path)
 
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
@@ -218,22 +224,9 @@ class DataReader:
         Returns:
             List of ticker symbols
         """
-        if data_type == "prices":
-            base_path = self.settings.prices_path
-        elif data_type == "quarterly":
-            base_path = self.settings.fundamentals_quarterly_path
-        elif data_type == "annual":
-            base_path = self.settings.fundamentals_annual_path
-        else:
-            raise ValueError(f"Unknown data_type: {data_type}")
-
-        tickers = []
-        for path in base_path.iterdir():
-            if path.is_dir() and path.name.startswith("ticker="):
-                ticker = path.name.replace("ticker=", "")
-                tickers.append(ticker)
-
-        return sorted(tickers)
+        base_path = self._get_base_path(data_type)
+        lf = self._scan_parquet(base_path)
+        return lf.select("ticker").unique().sort("ticker").collect().to_series().to_list()
 
     def get_date_range(self, ticker: str) -> tuple[date | None, date | None]:
         """Get the date range of available price data for a ticker.
@@ -271,14 +264,6 @@ class DataReader:
         Returns:
             True if data exists
         """
-        if data_type == "prices":
-            base_path = self.settings.prices_path
-        elif data_type == "quarterly":
-            base_path = self.settings.fundamentals_quarterly_path
-        elif data_type == "annual":
-            base_path = self.settings.fundamentals_annual_path
-        else:
-            raise ValueError(f"Unknown data_type: {data_type}")
-
+        base_path = self._get_base_path(data_type)
         ticker_path = base_path / f"ticker={ticker}"
         return ticker_path.exists() and any(ticker_path.glob("**/*.parquet"))
