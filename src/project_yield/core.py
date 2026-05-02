@@ -3,12 +3,14 @@
 from datetime import date
 
 import polars as pl
-from loguru import logger
 
 from project_yield.analysis.metrics import MetricsEngine
 from project_yield.analysis.ratios import RatioCalculator
+from project_yield.analysis.risk import RiskMetrics
 from project_yield.config import Settings, get_settings
+from project_yield.data.cross_validate import CrossValidator
 from project_yield.data.ingestion import DataIngestion
+from project_yield.data.openbb_client import OpenBBClient
 from project_yield.data.reader import DataReader
 from project_yield.data.writer import ParquetWriter
 from project_yield.visualization.charts import ChartBuilder
@@ -41,31 +43,58 @@ class ProjectYield:
     def __init__(self, settings: Settings | None = None) -> None:
         """Initialize ProjectYield with settings."""
         self.settings = settings or get_settings()
+        self._client = OpenBBClient(self.settings)
         self._reader = DataReader(self.settings)
         self._writer = ParquetWriter(self.settings)
-        self._calculator = RatioCalculator(self.settings)
-        self._metrics = MetricsEngine(self.settings)
-        self._ingestion = DataIngestion(self.settings)
+        self._calculator = RatioCalculator(self.settings, client=self._client)
+        self._metrics = MetricsEngine(self.settings, client=self._client)
+        self._ingestion = DataIngestion(self.settings, client=self._client)
         self._charts = ChartBuilder(self.settings)
+        self._risk = RiskMetrics(self.settings, reader=self._reader)
+        self._cross_validator: CrossValidator | None = None
+
+    @property
+    def cross_validator(self) -> CrossValidator:
+        """Lazy CrossValidator (instantiates a second OpenBB client for Polygon)."""
+        if self._cross_validator is None:
+            self._cross_validator = CrossValidator(self.settings, fmp_client=self._client)
+        return self._cross_validator
+
+    def cross_validate(
+        self,
+        ticker: str,
+        statement: str = "income",
+        period: str = "quarterly",
+        lookback: int = 4,
+    ) -> "pl.DataFrame":
+        """Compare FMP vs Polygon for a fundamentals statement. See CrossValidator."""
+        return self.cross_validator.cross_validate_fundamentals(
+            ticker, statement=statement, period=period, lookback=lookback
+        )
+
+    def cross_validate_prices(
+        self, ticker: str, lookback_days: int = 30
+    ) -> "pl.DataFrame":
+        """Compare FMP vs Polygon daily closes."""
+        return self.cross_validator.cross_validate_prices(ticker, lookback_days=lookback_days)
 
     # --- Data Management ---
 
     def update_data(
         self,
-        tickers: list[str] | None = None,
+        tickers: list[str],
         start_date: date | None = None,
     ) -> dict:
-        """Download and update financial data.
+        """Download and update financial data for the given tickers.
 
         Args:
-            tickers: List of tickers (None for S&P 500)
-            start_date: Start date for data (default from settings)
+            tickers: Explicit list of tickers to ingest. Required — no S&P 500 default
+                     (use ProjectYield.discover() for universe-wide discovery).
+            start_date: Start date for prices (default from settings).
 
         Returns:
-            Summary dict with counts
+            Summary dict with counts.
         """
-        if tickers is None:
-            return self._ingestion.download_sp500(start_date)
         return self._ingestion.update_all_data(tickers, start_date)
 
     def update_prices(self, tickers: list[str] | None = None) -> dict:
@@ -159,6 +188,14 @@ class ProjectYield:
         """Get PEG ratio for a ticker."""
         return self._calculator.get_peg_ratio(ticker, years)
 
+    def get_forward_pe(self, ticker: str, fiscal_period_offset: int = 1) -> float | None:
+        """Self-computed forward PE (current price ÷ FMP consensus EPS for FY+offset)."""
+        return self._calculator.get_forward_pe(ticker, fiscal_period_offset)
+
+    def get_forward_peg(self, ticker: str) -> float | None:
+        """Self-computed forward PEG."""
+        return self._calculator.get_forward_peg(ticker)
+
     # --- Screening & Comparison ---
 
     def screen(
@@ -237,6 +274,35 @@ class ProjectYield:
         """
         return self._metrics.rank_by_metric(metric, tickers, ascending, top_n)
 
+    def sector_groups(
+        self, group: str = "sector", metric: str = "valuation"
+    ) -> pl.DataFrame:
+        """Sector / industry / country roll-up via OpenBB (no local ingestion required)."""
+        return self._metrics.get_sector_groups(group=group, metric=metric)
+
+    def sharpe(self, ticker: str, rfr: float = 0.04, window: int = 252) -> pl.DataFrame:
+        """Rolling Sharpe ratio (computed locally via openbb-quantitative)."""
+        return self._risk.sharpe_ratio(ticker, rfr=rfr, window=window)
+
+    def sortino(self, ticker: str, window: int = 252) -> pl.DataFrame:
+        """Rolling Sortino ratio (computed locally)."""
+        return self._risk.sortino_ratio(ticker, window=window)
+
+    def risk_summary(self, ticker: str, window: int = 252) -> dict:
+        """Latest Sharpe / Sortino / kurtosis / skew for a ticker."""
+        return self._risk.risk_summary(ticker, window=window)
+
+    def discover(self, **filters) -> pl.DataFrame:
+        """Universe-wide ticker discovery via obb.equity.screener.
+
+        Returns candidate tickers + headline metrics. Pass results to update_data()
+        to ingest into local Parquet.
+
+        Common filters: market_cap_min, pe_max, sector, recommendation, etc.
+        Exact filter names depend on the underlying provider (finviz/fmp).
+        """
+        return self._client.screen_universe(**filters)
+
     def valuation_summary(self, ticker: str) -> dict:
         """Get comprehensive valuation summary.
 
@@ -249,6 +315,11 @@ class ProjectYield:
         return self._metrics.get_valuation_summary(ticker)
 
     # --- Access to underlying components ---
+
+    @property
+    def client(self) -> OpenBBClient:
+        """Access the OpenBBClient for direct provider calls."""
+        return self._client
 
     @property
     def reader(self) -> DataReader:

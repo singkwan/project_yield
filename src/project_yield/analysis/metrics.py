@@ -7,6 +7,7 @@ from loguru import logger
 
 from project_yield.analysis.ratios import RatioCalculator
 from project_yield.config import Settings, get_settings
+from project_yield.data.openbb_client import OpenBBClient
 from project_yield.data.reader import DataReader
 
 
@@ -17,11 +18,23 @@ class MetricsEngine:
     and perform comparative analysis.
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        client: OpenBBClient | None = None,
+    ) -> None:
         """Initialize engine with settings."""
         self.settings = settings or get_settings()
         self.reader = DataReader(self.settings)
-        self.calculator = RatioCalculator(self.settings)
+        self.calculator = RatioCalculator(self.settings, client=client)
+        self._client = client
+
+    @property
+    def client(self) -> OpenBBClient:
+        """Lazy OpenBBClient — only constructed if sector_groups is requested."""
+        if self._client is None:
+            self._client = OpenBBClient(self.settings)
+        return self._client
 
     def calculate_all_ratios(
         self,
@@ -112,11 +125,31 @@ class MetricsEngine:
 
         return df
 
-    def get_sector_averages(
+    def get_sector_groups(
+        self,
+        group: str = "sector",
+        metric: str = "valuation",
+    ) -> pl.DataFrame:
+        """Sector / industry / country roll-up via OpenBB (no local ingestion required).
+
+        Wraps obb.equity.compare.groups — pulls universe-wide aggregates on-demand.
+        For local-only sector averages over already-ingested tickers, use
+        get_sector_averages_local() instead.
+
+        Args:
+            group: One of "sector", "industry", "country", or sector code (e.g. "technology").
+            metric: One of "valuation", "performance", "overview".
+        """
+        return self.client.get_sector_groups(group=group, metric=metric)
+
+    def get_sector_averages_local(
         self,
         tickers: list[str],
     ) -> dict:
-        """Calculate average ratios for a group of tickers.
+        """Average ratios across a list of locally-ingested tickers.
+
+        Kept for the case where you want averages computed from your own
+        RatioCalculator output (consistent methodology) rather than OpenBB's.
 
         Args:
             tickers: List of tickers in the sector/group
@@ -129,14 +162,13 @@ class MetricsEngine:
         if df.is_empty():
             return {}
 
-        # Calculate means for numeric columns
         numeric_cols = [
             c for c in df.columns
             if c not in ["ticker", "as_of_date", "error"]
             and df[c].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
         ]
 
-        averages = {}
+        averages: dict = {}
         for col in numeric_cols:
             values = df[col].drop_nulls()
             if len(values) > 0:

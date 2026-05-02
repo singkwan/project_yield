@@ -23,6 +23,8 @@ class ParquetWriter:
             self.settings.prices_path,
             self.settings.fundamentals_quarterly_path,
             self.settings.fundamentals_annual_path,
+            self.settings.provider_ratios_quarterly_path,
+            self.settings.provider_ratios_annual_path,
             self.settings.metadata_path,
         ]:
             path.mkdir(parents=True, exist_ok=True)
@@ -157,6 +159,42 @@ class ParquetWriter:
         logger.info(f"Wrote {ticker} annual fundamentals: {len(df)} rows to {file_path}")
         return file_path
 
+    def write_provider_ratios(
+        self,
+        df: pl.DataFrame,
+        ticker: str,
+        period: str = "quarterly",
+    ) -> Path | None:
+        """Write provider-published ratios (e.g. FMP) for cross-validation.
+
+        Args:
+            df: DataFrame of ratios from OpenBB / FMP
+            ticker: Stock ticker symbol
+            period: "quarterly" or "annual"
+
+        Returns:
+            Path to written file, or None if empty
+        """
+        if df.is_empty():
+            logger.warning(f"Empty {period} provider ratios for {ticker}, skipping write")
+            return None
+
+        if "ticker" not in df.columns:
+            df = df.with_columns(pl.lit(ticker).alias("ticker"))
+
+        base_path = (
+            self.settings.provider_ratios_quarterly_path
+            if period == "quarterly"
+            else self.settings.provider_ratios_annual_path
+        )
+        partition_path = self._get_partition_path(base_path, ticker)
+        partition_path.mkdir(parents=True, exist_ok=True)
+
+        file_path = partition_path / "data.parquet"
+        df.write_parquet(file_path, compression="snappy")
+        logger.info(f"Wrote {ticker} {period} provider ratios: {len(df)} rows to {file_path}")
+        return file_path
+
     def write_metadata(
         self,
         df: pl.DataFrame,
@@ -245,6 +283,8 @@ class ParquetWriter:
             self.settings.prices_path,
             self.settings.fundamentals_quarterly_path,
             self.settings.fundamentals_annual_path,
+            self.settings.provider_ratios_quarterly_path,
+            self.settings.provider_ratios_annual_path,
         ]:
             ticker_path = base_path / f"ticker={ticker}"
             if ticker_path.exists():

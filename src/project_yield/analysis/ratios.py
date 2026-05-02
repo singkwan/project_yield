@@ -6,19 +6,34 @@ import polars as pl
 from loguru import logger
 
 from project_yield.config import Settings, get_settings
+from project_yield.data.openbb_client import OpenBBClient
 from project_yield.data.reader import DataReader
 
 
 class RatioCalculator:
     """Calculates financial ratios from price and fundamental data.
 
-    All ratios use trailing twelve months (TTM) data where applicable.
+    All trailing ratios use TTM data where applicable. Forward ratios are
+    self-computed from analyst consensus EPS (pulled via OpenBBClient) divided
+    by the latest local price — methodology consistent with trailing PE/PEG.
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        client: OpenBBClient | None = None,
+    ) -> None:
         """Initialize calculator with settings."""
         self.settings = settings or get_settings()
         self.reader = DataReader(self.settings)
+        self._client = client  # lazily created for forward-looking ratios
+
+    @property
+    def client(self) -> OpenBBClient:
+        """Lazy OpenBBClient — only constructed if forward metrics are requested."""
+        if self._client is None:
+            self._client = OpenBBClient(self.settings)
+        return self._client
 
     def get_pe_ratio(
         self,
@@ -260,9 +275,9 @@ class RatioCalculator:
         """
         lf = self.reader.get_fundamentals_quarterly(ticker=ticker)
         if as_of_date:
-            lf = lf.filter(pl.col("fiscal_period") <= as_of_date)
+            lf = lf.filter(pl.col("report_date") <= as_of_date)
 
-        df = lf.sort("fiscal_period", descending=True).collect()
+        df = lf.sort("report_date", descending=True).collect()
 
         if df.is_empty():
             return None
@@ -351,6 +366,139 @@ class RatioCalculator:
         ratio = abs(capex) / revenue  # CapEx is typically negative in cash flow
         return round(ratio, 4)
 
+    def get_forward_pe(
+        self, ticker: str, fiscal_period_offset: int = 1
+    ) -> float | None:
+        """Self-computed forward PE = current price ÷ consensus EPS for FY+offset.
+
+        Pulls analyst consensus forward EPS from OpenBB (FMP), takes the mean
+        for the requested fiscal period offset, divides current price (from local
+        Parquet) by it. We do NOT use FMP's pre-computed forward PE — the
+        methodology stays identical to trailing PE.
+        """
+        eps = self._get_forward_eps_mean(ticker, fiscal_period_offset)
+        if eps is None or eps == 0:
+            return None
+
+        price_df = self.reader.get_latest_price(ticker)
+        if price_df.is_empty():
+            logger.warning(f"{ticker}: no local price for forward PE")
+            return None
+        price = price_df["close"][0]
+        return round(price / eps, 2)
+
+    def get_forward_peg(self, ticker: str) -> float | None:
+        """Forward PEG = forward PE ÷ analyst-implied forward EPS growth.
+
+        Growth comes from the ratio of FY+1 to FY+0 (current FY) consensus EPS.
+        """
+        forward_pe = self.get_forward_pe(ticker, fiscal_period_offset=1)
+        if forward_pe is None:
+            return None
+
+        eps_now = self._get_forward_eps_mean(ticker, 0)
+        eps_next = self._get_forward_eps_mean(ticker, 1)
+        if eps_now is None or eps_next is None or eps_now <= 0:
+            return None
+
+        growth = (eps_next - eps_now) / abs(eps_now)
+        if growth <= 0:
+            logger.warning(f"{ticker}: non-positive forward EPS growth, PEG undefined")
+            return None
+        return round(forward_pe / (growth * 100), 2)
+
+    def _get_forward_eps_mean(
+        self, ticker: str, fiscal_period_offset: int
+    ) -> float | None:
+        """Mean consensus EPS for the requested offset from `obb.equity.estimates.forward_eps`.
+
+        offset=0 means the current FY, offset=1 means next FY, etc.
+        """
+        try:
+            df = self.client.get_forward_eps(ticker)
+        except Exception as e:
+            logger.warning(f"{ticker}: forward EPS fetch failed: {e}")
+            return None
+        if df.is_empty():
+            return None
+
+        candidates = ["mean", "estimated_eps_mean", "eps_avg", "eps_mean"]
+        eps_col = next((c for c in candidates if c in df.columns), None)
+        if eps_col is None:
+            logger.warning(
+                f"{ticker}: forward EPS DataFrame missing mean column; saw {df.columns}"
+            )
+            return None
+
+        sort_col = next(
+            (c for c in ("date", "period_ending", "fiscal_year") if c in df.columns),
+            None,
+        )
+        if sort_col is not None:
+            df = df.sort(sort_col)
+
+        if fiscal_period_offset >= df.height:
+            return None
+        value = df[eps_col][fiscal_period_offset]
+        return float(value) if value is not None else None
+
+    def get_provider_ratios_latest(self, ticker: str) -> dict:
+        """Latest row of cached FMP-published ratios for a ticker.
+
+        Tries quarterly first, falls back to annual (FMP Starter blocks the
+        quarterly ratios endpoint). Returns empty dict if neither is cached.
+        """
+        for period in ("quarterly", "annual"):
+            lf = self.reader.get_provider_ratios(ticker=ticker, period=period)
+            df = lf.collect()
+            if df.is_empty():
+                continue
+            sort_col = next(
+                (c for c in ("report_date", "fiscal_year") if c in df.columns), None
+            )
+            if sort_col is not None:
+                df = df.sort(sort_col, descending=True)
+            return df.head(1).row(0, named=True)
+        return {}
+
+    def get_provider_pe_ratio(self, ticker: str) -> float | None:
+        """FMP-published PE for cross-validation against get_pe_ratio()."""
+        return self._provider_metric(ticker, ["price_to_earnings", "pe_ratio", "pe"])
+
+    def get_provider_pb_ratio(self, ticker: str) -> float | None:
+        """FMP-published price-to-book."""
+        return self._provider_metric(
+            ticker, ["price_to_book", "price_to_book_value", "pb_ratio"]
+        )
+
+    def get_provider_ps_ratio(self, ticker: str) -> float | None:
+        """FMP-published price-to-sales."""
+        return self._provider_metric(ticker, ["price_to_sales", "ps_ratio"])
+
+    def get_provider_roe(self, ticker: str) -> float | None:
+        """FMP-published return on equity."""
+        return self._provider_metric(ticker, ["return_on_equity", "roe"])
+
+    def get_provider_roa(self, ticker: str) -> float | None:
+        """FMP-published return on assets."""
+        return self._provider_metric(ticker, ["return_on_assets", "roa"])
+
+    def _provider_metric(
+        self, ticker: str, candidate_columns: list[str]
+    ) -> float | None:
+        """Pull a single metric from cached provider ratios, trying each candidate column."""
+        latest = self.get_provider_ratios_latest(ticker)
+        if not latest:
+            return None
+        for col in candidate_columns:
+            if col in latest and latest[col] is not None:
+                value = latest[col]
+                return round(float(value), 4) if isinstance(value, (int, float)) else None
+        logger.debug(
+            f"{ticker}: none of {candidate_columns} present in provider ratios"
+        )
+        return None
+
     def get_all_ratios(
         self,
         ticker: str,
@@ -370,6 +518,8 @@ class RatioCalculator:
             "as_of_date": str(as_of_date) if as_of_date else "latest",
             "pe_ratio": self.get_pe_ratio(ticker, as_of_date),
             "peg_ratio": self.get_peg_ratio(ticker, as_of_date=as_of_date),
+            "forward_pe": self.get_forward_pe(ticker),
+            "forward_peg": self.get_forward_peg(ticker),
             "operating_margin": self.get_operating_margin(ticker, as_of_date),
             "net_profit_margin": self.get_net_profit_margin(ticker, as_of_date),
             "gross_margin": self.get_gross_margin(ticker, as_of_date),
@@ -399,9 +549,9 @@ class RatioCalculator:
         """
         lf = self.reader.get_fundamentals_quarterly(ticker=ticker)
         if as_of_date:
-            lf = lf.filter(pl.col("fiscal_period") <= as_of_date)
+            lf = lf.filter(pl.col("report_date") <= as_of_date)
 
-        df = lf.sort("fiscal_period", descending=True).collect()
+        df = lf.sort("report_date", descending=True).collect()
 
         if df.is_empty():
             return None
@@ -465,9 +615,9 @@ class RatioCalculator:
         """
         lf = self.reader.get_fundamentals_quarterly(ticker=ticker)
         if as_of_date:
-            lf = lf.filter(pl.col("fiscal_period") <= as_of_date)
+            lf = lf.filter(pl.col("report_date") <= as_of_date)
 
-        df = lf.sort("fiscal_period", descending=True).collect()
+        df = lf.sort("report_date", descending=True).collect()
 
         if df.is_empty() or column not in df.columns:
             return None

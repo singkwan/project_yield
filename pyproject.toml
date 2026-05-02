@@ -27,8 +27,14 @@ classifiers = [
 dependencies = [
     "polars[all]>=1.18.0",
     "pyarrow>=18.1.0",
-    "pandas>=2.0.0,<3.0.0",  # Pin to 2.x for simfin compatibility
-    "simfin>=0.9.0",
+    "pandas>=2.0.0",
+    "openbb>=4.4.0",
+    "openbb-equity>=1.4.0",
+    "openbb-yfinance>=1.4.0",
+    "openbb-fmp>=1.4.0",
+    "openbb-polygon>=1.4.0",
+    "openbb-finviz>=1.4.0",
+    "openbb-quantitative>=1.4.0",
     "requests>=2.32.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.10.0",
@@ -153,7 +159,8 @@ pretty = true
 
 [[tool.mypy.overrides]]
 module = [
-    "simfin.*",
+    "openbb.*",
+    "openbb_core.*",
     "plotly.*",
 ]
 ignore_missing_imports = true

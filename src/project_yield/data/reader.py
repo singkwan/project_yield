@@ -30,6 +30,8 @@ class DataReader:
             "prices": self.settings.prices_path,
             "quarterly": self.settings.fundamentals_quarterly_path,
             "annual": self.settings.fundamentals_annual_path,
+            "ratios_quarterly": self.settings.provider_ratios_quarterly_path,
+            "ratios_annual": self.settings.provider_ratios_annual_path,
         }
         if data_type not in paths:
             raise ValueError(f"Unknown data_type: {data_type}")
@@ -41,6 +43,20 @@ class DataReader:
             return pl.LazyFrame()
         pattern = self._get_parquet_pattern(base_path)
         return pl.scan_parquet(pattern)
+
+    def _scan_ticker(self, base_path: Path, ticker: str) -> pl.LazyFrame | None:
+        """Scan parquet files only under a single ticker partition.
+
+        Returns None when no data exists so callers can short-circuit before
+        applying filters that would fail on an empty schema.
+        """
+        ticker_path = base_path / f"ticker={ticker}"
+        if not ticker_path.exists():
+            return None
+        files = list(ticker_path.glob("**/*.parquet"))
+        if not files:
+            return None
+        return pl.scan_parquet(str(ticker_path / "**" / "*.parquet"))
 
     def get_prices(
         self,
@@ -63,11 +79,13 @@ class DataReader:
         Returns:
             LazyFrame with price data
         """
-        lf = self._scan_parquet(self.settings.prices_path)
-
-        # Apply filters
         if ticker is not None:
-            lf = lf.filter(pl.col("ticker") == ticker)
+            scanned = self._scan_ticker(self.settings.prices_path, ticker)
+            if scanned is None:
+                return pl.LazyFrame()
+            lf = scanned.filter(pl.col("ticker") == ticker)
+        else:
+            lf = self._scan_parquet(self.settings.prices_path)
 
         if start_date is not None:
             lf = lf.filter(pl.col("date") >= start_date)
@@ -98,10 +116,13 @@ class DataReader:
         Returns:
             LazyFrame with quarterly fundamentals
         """
-        lf = self._scan_parquet(self.settings.fundamentals_quarterly_path)
-
         if ticker is not None:
-            lf = lf.filter(pl.col("ticker") == ticker)
+            scanned = self._scan_ticker(self.settings.fundamentals_quarterly_path, ticker)
+            if scanned is None:
+                return pl.LazyFrame()
+            lf = scanned.filter(pl.col("ticker") == ticker)
+        else:
+            lf = self._scan_parquet(self.settings.fundamentals_quarterly_path)
 
         if columns is not None:
             cols = list(set(columns) | {"ticker"})
@@ -125,10 +146,50 @@ class DataReader:
         Returns:
             LazyFrame with annual fundamentals
         """
-        lf = self._scan_parquet(self.settings.fundamentals_annual_path)
-
         if ticker is not None:
-            lf = lf.filter(pl.col("ticker") == ticker)
+            scanned = self._scan_ticker(self.settings.fundamentals_annual_path, ticker)
+            if scanned is None:
+                return pl.LazyFrame()
+            lf = scanned.filter(pl.col("ticker") == ticker)
+        else:
+            lf = self._scan_parquet(self.settings.fundamentals_annual_path)
+
+        if columns is not None:
+            cols = list(set(columns) | {"ticker"})
+            available = lf.collect_schema().names()
+            cols = [c for c in cols if c in available]
+            lf = lf.select(cols)
+
+        return lf
+
+    def get_provider_ratios(
+        self,
+        ticker: str | None = None,
+        period: str = "quarterly",
+        columns: list[str] | None = None,
+    ) -> pl.LazyFrame:
+        """Read FMP-published ratios cached at ingest time.
+
+        Args:
+            ticker: Filter by ticker (None for all)
+            period: "quarterly" or "annual"
+            columns: Specific columns to select (None for all)
+
+        Returns:
+            LazyFrame with provider ratios
+        """
+        base_path = (
+            self.settings.provider_ratios_quarterly_path
+            if period == "quarterly"
+            else self.settings.provider_ratios_annual_path
+        )
+        if ticker is not None:
+            scanned = self._scan_ticker(base_path, ticker)
+            if scanned is None:
+                return pl.LazyFrame()
+            lf = scanned.filter(pl.col("ticker") == ticker)
+        else:
+            lf = self._scan_parquet(base_path)
 
         if columns is not None:
             cols = list(set(columns) | {"ticker"})
@@ -190,11 +251,12 @@ class DataReader:
         lf = self.get_fundamentals_quarterly(ticker=ticker)
 
         if as_of_date is not None:
-            # Filter to quarters ending before as_of_date
-            lf = lf.filter(pl.col("fiscal_period") <= as_of_date)
+            # Filter to quarters reported on or before as_of_date
+            lf = lf.filter(pl.col("report_date") <= as_of_date)
 
-        # Get last 4 quarters
-        df = lf.sort("fiscal_period", descending=True).head(4).collect()
+        # Get last 4 quarters by report_date (fiscal_period is a string label
+        # like "Q1"/"Q2", not a sortable date — sorting by it would mix years).
+        df = lf.sort("report_date", descending=True).head(4).collect()
 
         if len(df) < 4:
             logger.warning(f"{ticker}: Only {len(df)} quarters available for TTM")

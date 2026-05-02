@@ -62,7 +62,8 @@ dmypy.json
 .pytype/
 
 # Data directories (all data is generated via ingestion pipeline)
-data/
+# Anchored to repo root — must NOT match src/project_yield/data/ (source code).
+/data/
 
 # Logs
 logs/*.log
@@ -76,6 +77,8 @@ logs/*.log
 .env
 .env.local
 .env.*.local
+config.yaml
+config.local.yaml
 
 # OS
 .DS_Store
