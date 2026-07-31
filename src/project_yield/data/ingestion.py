@@ -1,12 +1,18 @@
-"""Data ingestion: pull data per-ticker from OpenBB and persist to Parquet."""
+"""Data ingestion: pull data per-ticker from OpenBB and persist to Parquet.
+
+Also wires IBKR portfolio sync so held tickers can drive what gets ingested.
+"""
 
 from datetime import date, datetime
 
 import polars as pl
 from loguru import logger
 
+from project_yield.brokers.flex_csv import load_flex_csv
 from project_yield.config import Settings, get_settings
 from project_yield.data.openbb_client import OpenBBClient
+from project_yield.data.symbology import ibkr_to_yfinance, is_foreign_ticker
+from project_yield.data.portfolio import PortfolioReader, PortfolioWriter
 from project_yield.data.reader import DataReader
 from project_yield.data.writer import ParquetWriter
 
@@ -24,11 +30,15 @@ class DataIngestion:
         self,
         settings: Settings | None = None,
         client: OpenBBClient | None = None,
+        broker: object | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.client = client or OpenBBClient(self.settings)
         self.writer = ParquetWriter(self.settings)
         self.reader = DataReader(self.settings)
+        self.portfolio_writer = PortfolioWriter(self.settings)
+        self.portfolio_reader = PortfolioReader(self.settings)
+        self._broker = broker  # Lazy: only constructed when sync_holdings() is called
 
     def update_all_data(
         self,
@@ -94,35 +104,54 @@ class DataIngestion:
         include_provider_ratios: bool,
         summary: dict,
     ) -> None:
-        prices = self.client.get_prices(ticker, start_date=start_date)
+        # Translate broker-native (IBKR) symbols to yfinance form once, here at
+        # the boundary. Everything downstream — API calls, partition keys,
+        # parquet `ticker` columns — operates on yf_ticker.
+        yf_ticker = ibkr_to_yfinance(ticker)
+        if yf_ticker != ticker:
+            logger.info(f"Translated {ticker} → {yf_ticker} (yfinance form)")
+
+        # Foreign listings aren't on FMP; route them through yfinance.
+        use_yfinance = is_foreign_ticker(yf_ticker)
+        provider = "yfinance" if use_yfinance else None
+
+        prices = self.client.get_prices(yf_ticker, start_date=start_date, provider=provider)
         if not prices.is_empty():
-            self.writer.write_prices(prices, ticker)
+            self.writer.write_prices(prices, yf_ticker)
             summary["prices_written"] += len(prices)
 
         if include_fundamentals:
             for period in ("quarterly", "annual"):
-                fundamentals = self.client.get_fundamentals(ticker, period=period)
+                try:
+                    fundamentals = self.client.get_fundamentals(
+                        yf_ticker, period=period, provider=provider
+                    )
+                except Exception as e:
+                    logger.warning(f"{yf_ticker}: {period} fundamentals unavailable: {e}")
+                    continue
                 if fundamentals.is_empty():
                     continue
                 if period == "quarterly":
-                    self.writer.write_fundamentals_quarterly(fundamentals, ticker)
+                    self.writer.write_fundamentals_quarterly(fundamentals, yf_ticker)
                 else:
-                    self.writer.write_fundamentals_annual(fundamentals, ticker)
+                    self.writer.write_fundamentals_annual(fundamentals, yf_ticker)
                 summary["fundamentals_written"] += len(fundamentals)
 
-        if include_provider_ratios:
+        # Provider ratios (FMP/Polygon endpoint) — yfinance doesn't expose this,
+        # so skip silently for foreign tickers.
+        if include_provider_ratios and not use_yfinance:
             for period in ("quarterly", "annual"):
                 try:
-                    ratios = self.client.get_provider_ratios(ticker, period=period)
-                    metrics = self.client.get_provider_metrics(ticker, period=period)
+                    ratios = self.client.get_provider_ratios(yf_ticker, period=period)
+                    metrics = self.client.get_provider_metrics(yf_ticker, period=period)
                 except Exception as e:
-                    logger.warning(f"{ticker}: provider ratios unavailable for {period}: {e}")
+                    logger.warning(f"{yf_ticker}: provider ratios unavailable for {period}: {e}")
                     continue
 
                 merged = self._merge_ratios_metrics(ratios, metrics)
                 if merged.is_empty():
                     continue
-                self.writer.write_provider_ratios(merged, ticker, period=period)
+                self.writer.write_provider_ratios(merged, yf_ticker, period=period)
                 summary["ratios_written"] += len(merged)
 
     @staticmethod
@@ -177,6 +206,246 @@ class DataIngestion:
             f"{summary['new_records']} new records"
         )
         return summary
+
+    # --- IBKR portfolio sync (lazy broker construction) ---
+
+    @property
+    def broker(self):
+        """Lazy IBKRClient — only constructed when actually needed."""
+        if self._broker is None:
+            from project_yield.brokers import IBKRClient
+            self._broker = IBKRClient(self.settings)
+        return self._broker
+
+    def sync_holdings(
+        self,
+        include_transactions: bool = True,
+        include_watchlists: bool = True,
+        include_activity: bool = True,
+        transaction_lookback_days: int = 365,
+    ) -> dict:
+        """Pull positions + transactions + watchlists + Flex activity from IBKR.
+
+        Does NOT trigger OpenBB ingestion (per "explicit refresh" decision).
+        Use update_held() or update_held_and_watched() for that.
+
+        include_activity (Flex Web Service: dividends, interest, NAV history)
+        is independent of OAuth and only requires ibkr_flex_token + query IDs.
+        """
+        summary: dict = {
+            "positions_rows": 0,
+            "transactions_rows": 0,
+            "watchlists_count": 0,
+            "dividends_rows": 0,
+            "interest_rows": 0,
+            "nav_history_rows": 0,
+            "errors": [],
+        }
+
+        try:
+            positions = self.broker.get_positions()
+            if not positions.is_empty():
+                self.portfolio_writer.write_positions_snapshot(positions)
+                summary["positions_rows"] = len(positions)
+        except Exception as e:
+            logger.error(f"sync_holdings: positions fetch failed: {e}")
+            summary["errors"].append(f"positions: {e}")
+
+        if include_transactions:
+            try:
+                transactions = self.broker.get_transactions(days=transaction_lookback_days)
+                if not transactions.is_empty():
+                    self.portfolio_writer.write_transactions(transactions)
+                    summary["transactions_rows"] = len(transactions)
+            except Exception as e:
+                logger.error(f"sync_holdings: transactions fetch failed: {e}")
+                summary["errors"].append(f"transactions: {e}")
+
+        if include_watchlists:
+            try:
+                lists = self.broker.get_watchlists()
+                for entry in lists:
+                    list_id = entry.get("id") if isinstance(entry, dict) else None
+                    if not list_id:
+                        continue
+                    df = self.broker.get_watchlist(list_id)
+                    if not df.is_empty():
+                        self.portfolio_writer.write_watchlist(df, list_id)
+                        summary["watchlists_count"] += 1
+            except Exception as e:
+                logger.error(f"sync_holdings: watchlists fetch failed: {e}")
+                summary["errors"].append(f"watchlists: {e}")
+
+        if include_activity:
+            self._sync_activity(summary)
+
+        logger.info(f"sync_holdings done: {summary}")
+        return summary
+
+    def sync_via_flex_csv(self, csv_path) -> dict:
+        """Bootstrap from a manually-downloaded Flex CSV file (no API call).
+
+        Use this when IBKR's Flex Web Service is rate-limited and you've
+        downloaded the report yourself from the Client Portal as CSV.
+        """
+
+        bundle = load_flex_csv(csv_path)
+        summary: dict = {
+            "positions_rows": 0, "transactions_rows": 0,
+            "dividends_rows": 0, "interest_rows": 0, "nav_history_rows": 0,
+            "errors": [],
+        }
+        try:
+            self._persist_flex_bundle(bundle, date.today().year, summary)
+        except Exception as e:
+            logger.error(f"sync_via_flex_csv: persist failed: {e}")
+            summary["errors"].append(f"persist: {e}")
+        logger.info(f"sync_via_flex_csv done: {summary}")
+        return summary
+
+    def sync_via_flex(
+        self,
+        consolidated: bool = True,
+        positions_query_id: str | None = None,
+        trades_query_id: str | None = None,
+        dividends_query_id: str | None = None,
+        interest_query_id: str | None = None,
+        nav_query_id: str | None = None,
+        consolidated_query_id: str | None = None,
+    ) -> dict:
+        """Bootstrap portfolio data from Flex Web Service only — no OAuth required.
+
+        Covers everything except watchlists (Flex doesn't expose watchlists).
+
+        consolidated=True: one Flex query returns all sections (recommended —
+        avoids IBKR's per-query rate limit). Override consolidated_query_id or
+        rely on Settings.ibkr_flex_consolidated_query_id.
+
+        consolidated=False: separate per-section queries. Slower (multiple Flex
+        round-trips with rate-limit risk) but works if you can't fit all
+        sections into one Flex query.
+        """
+        summary: dict = {
+            "positions_rows": 0, "transactions_rows": 0,
+            "dividends_rows": 0, "interest_rows": 0, "nav_history_rows": 0,
+            "errors": [],
+        }
+        year = date.today().year
+
+        if consolidated:
+            try:
+                bundle = self.broker.get_consolidated_report(consolidated_query_id)
+                self._persist_flex_bundle(bundle, year, summary)
+            except Exception as e:
+                logger.error(f"sync_via_flex consolidated: {e}")
+                summary["errors"].append(f"consolidated: {e}")
+            logger.info(f"sync_via_flex done: {summary}")
+            return summary
+
+        # Per-section path
+        try:
+            df = self.broker.get_positions_report(positions_query_id)
+            if not df.is_empty():
+                self.portfolio_writer.write_positions_snapshot(df)
+                summary["positions_rows"] = len(df)
+        except Exception as e:
+            summary["errors"].append(f"positions: {e}")
+        try:
+            df = self.broker.get_trades_report(trades_query_id)
+            if not df.is_empty():
+                self.portfolio_writer.write_transactions(df)
+                summary["transactions_rows"] = len(df)
+        except Exception as e:
+            summary["errors"].append(f"trades: {e}")
+        for label, fetch, write, qid in (
+            ("dividends", self.broker.get_dividends_report, self.portfolio_writer.write_dividends, dividends_query_id),
+            ("interest", self.broker.get_interest_report, self.portfolio_writer.write_interest, interest_query_id),
+            ("nav_history", self.broker.get_nav_history_report, self.portfolio_writer.write_nav_history, nav_query_id),
+        ):
+            try:
+                df = fetch(qid) if qid else fetch()
+                if not df.is_empty():
+                    write(df, year)
+                    summary[f"{label}_rows"] = len(df)
+            except Exception as e:
+                summary["errors"].append(f"{label}: {e}")
+
+        logger.info(f"sync_via_flex done: {summary}")
+        return summary
+
+    def _persist_flex_bundle(self, bundle: dict, year: int, summary: dict) -> None:
+        """Write each section of a consolidated Flex bundle to its Parquet partition.
+
+        For positions: Flex returns one snapshot per `reportDate` in the period,
+        so we split and write each date as its own snapshot. positions_latest.parquet
+        ends up with only the most recent date's rows (handled by writer overwrite
+        order — we write oldest first, newest last).
+        """
+        positions = bundle["positions"]
+        if not positions.is_empty():
+            if "reportDate" in positions.columns:
+                dates = sorted(positions["reportDate"].drop_nulls().unique().to_list())
+                for d in dates:
+                    day = positions.filter(pl.col("reportDate") == d)
+                    self.portfolio_writer.write_positions_snapshot(day, snapshot_date=d)
+                summary["positions_rows"] = len(positions)
+                summary["positions_snapshot_days"] = len(dates)
+            else:
+                self.portfolio_writer.write_positions_snapshot(positions)
+                summary["positions_rows"] = len(positions)
+        if not bundle["trades"].is_empty():
+            self.portfolio_writer.write_transactions(bundle["trades"])
+            summary["transactions_rows"] = len(bundle["trades"])
+        if not bundle["dividends"].is_empty():
+            self.portfolio_writer.write_dividends(bundle["dividends"], year)
+            summary["dividends_rows"] = len(bundle["dividends"])
+        if not bundle["interest"].is_empty():
+            self.portfolio_writer.write_interest(bundle["interest"], year)
+            summary["interest_rows"] = len(bundle["interest"])
+        if not bundle["nav_history"].is_empty():
+            self.portfolio_writer.write_nav_history(bundle["nav_history"], year)
+            summary["nav_history_rows"] = len(bundle["nav_history"])
+
+    def _sync_activity(self, summary: dict) -> None:
+        """Pull Flex reports (dividends, interest, NAV) and persist by year."""
+        year = date.today().year
+        for label, fetch, write in (
+            ("dividends", self.broker.get_dividends_report, self.portfolio_writer.write_dividends),
+            ("interest", self.broker.get_interest_report, self.portfolio_writer.write_interest),
+            ("nav_history", self.broker.get_nav_history_report, self.portfolio_writer.write_nav_history),
+        ):
+            try:
+                df = fetch()
+                if not df.is_empty():
+                    write(df, year)
+                    summary[f"{label}_rows"] = len(df)
+            except Exception as e:
+                logger.warning(f"sync_holdings: {label} fetch skipped: {e}")
+                summary["errors"].append(f"{label}: {e}")
+
+    def update_held_tickers(self, start_date: date | None = None) -> dict:
+        """Run OpenBB ingestion for tickers in the latest positions snapshot.
+
+        Reads from local Parquet — does NOT re-fetch from IBKR. Call sync_holdings()
+        first if you want fresh holdings.
+        """
+        held = self.portfolio_reader.list_held_tickers()
+        if not held:
+            logger.warning("No held tickers in latest positions snapshot")
+            return {"tickers_processed": 0, "errors": ["no held tickers"]}
+        logger.info(f"Updating {len(held)} held tickers via OpenBB")
+        return self.update_all_data(held, start_date)
+
+    def update_held_and_watched(self, start_date: date | None = None) -> dict:
+        """OpenBB ingestion for the union of held + watched tickers."""
+        held = set(self.portfolio_reader.list_held_tickers())
+        watched = set(self.portfolio_reader.list_watched_tickers())
+        tickers = sorted(held | watched)
+        if not tickers:
+            logger.warning("No held or watched tickers found")
+            return {"tickers_processed": 0, "errors": ["no held or watched tickers"]}
+        logger.info(f"Updating {len(tickers)} tickers ({len(held)} held + {len(watched)} watched)")
+        return self.update_all_data(tickers, start_date)
 
     def get_data_summary(self) -> dict:
         """Get summary of stored data."""

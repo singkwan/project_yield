@@ -5,6 +5,7 @@ from datetime import date
 import polars as pl
 
 from project_yield.analysis.metrics import MetricsEngine
+from project_yield.analysis.portfolio import PortfolioAnalysis
 from project_yield.analysis.ratios import RatioCalculator
 from project_yield.analysis.risk import RiskMetrics
 from project_yield.config import Settings, get_settings
@@ -52,6 +53,11 @@ class ProjectYield:
         self._charts = ChartBuilder(self.settings)
         self._risk = RiskMetrics(self.settings, reader=self._reader)
         self._cross_validator: CrossValidator | None = None
+        self._portfolio_analysis = PortfolioAnalysis(
+            self.settings,
+            portfolio_reader=self._ingestion.portfolio_reader,
+            data_reader=self._reader,
+        )
 
     @property
     def cross_validator(self) -> CrossValidator:
@@ -96,6 +102,169 @@ class ProjectYield:
             Summary dict with counts.
         """
         return self._ingestion.update_all_data(tickers, start_date)
+
+    # --- IBKR portfolio sync ---
+
+    def sync_holdings(
+        self,
+        include_transactions: bool = True,
+        include_watchlists: bool = True,
+        include_activity: bool = True,
+        transaction_lookback_days: int = 365,
+    ) -> dict:
+        """Pull positions, transactions, watchlists, and Flex activity from IBKR.
+
+        Does not trigger OpenBB ingestion — call update_held() or
+        update_held_and_watched() afterward to refresh prices/fundamentals
+        for the held / watched tickers.
+        """
+        return self._ingestion.sync_holdings(
+            include_transactions=include_transactions,
+            include_watchlists=include_watchlists,
+            include_activity=include_activity,
+            transaction_lookback_days=transaction_lookback_days,
+        )
+
+    def sync_via_flex_csv(self, csv_path) -> dict:
+        """Bootstrap from a manually-downloaded Flex CSV file (no API call)."""
+        return self._ingestion.sync_via_flex_csv(csv_path)
+
+    def sync_via_flex(
+        self,
+        consolidated: bool = True,
+        positions_query_id: str | None = None,
+        trades_query_id: str | None = None,
+        dividends_query_id: str | None = None,
+        interest_query_id: str | None = None,
+        nav_query_id: str | None = None,
+        consolidated_query_id: str | None = None,
+    ) -> dict:
+        """Bootstrap portfolio data from Flex Web Service alone (no OAuth needed).
+
+        Pass query IDs explicitly OR set the corresponding fields in
+        Settings (config.yaml). Use consolidated=True with a single Flex
+        query containing all sections to dodge IBKR's per-query rate limit.
+        """
+        return self._ingestion.sync_via_flex(
+            consolidated=consolidated,
+            positions_query_id=positions_query_id,
+            trades_query_id=trades_query_id,
+            dividends_query_id=dividends_query_id,
+            interest_query_id=interest_query_id,
+            nav_query_id=nav_query_id,
+            consolidated_query_id=consolidated_query_id,
+        )
+
+    # --- Portfolio analysis (Phase 4) ---
+
+    def current_value(self) -> pl.DataFrame:
+        """Latest positions joined with latest local prices for live MV / PnL."""
+        return self._portfolio_analysis.current_value()
+
+    def position_pnl(self, ticker: str, as_of: date | None = None) -> dict:
+        """Per-ticker realized + unrealized PnL via transaction-replay."""
+        return self._portfolio_analysis.position_pnl(ticker, as_of)
+
+    def portfolio_value_history(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        source: str = "nav",
+    ) -> pl.DataFrame:
+        """Portfolio value over time (Flex NAV by default; transaction-replay fallback)."""
+        return self._portfolio_analysis.portfolio_value_history(start_date, end_date, source=source)  # type: ignore[arg-type]
+
+    def ytd_performance(self, year: int | None = None) -> dict:
+        """YTD return %."""
+        return self._portfolio_analysis.ytd_performance(year)
+
+    def monthly_performance(self, months: int = 12) -> pl.DataFrame:
+        """Monthly returns for the last N months."""
+        return self._portfolio_analysis.monthly_performance(months)
+
+    def winners(self, top_n: int = 10, by: str = "dollar") -> pl.DataFrame:
+        """Top N winning positions by $ or % unrealized PnL."""
+        return self._portfolio_analysis.winners(top_n=top_n, by=by)  # type: ignore[arg-type]
+
+    def losers(self, top_n: int = 10, by: str = "dollar") -> pl.DataFrame:
+        """Top N losing positions by $ or % unrealized PnL."""
+        return self._portfolio_analysis.losers(top_n=top_n, by=by)  # type: ignore[arg-type]
+
+    def holdings_summary(self) -> pl.DataFrame:
+        """Concentration view: ticker, asset_class, currency, MV, weight %."""
+        return self._portfolio_analysis.holdings_summary()
+
+    # --- Flex Web Service activity (Phase 5) ---
+
+    def dividends(self, ticker: str | None = None, year: int | None = None) -> pl.DataFrame:
+        """Cached dividend events from Flex (year filter optional)."""
+        return self._ingestion.portfolio_reader.get_dividends(ticker=ticker, year=year).collect()
+
+    def interest_income(self, year: int | None = None) -> pl.DataFrame:
+        """Cached interest events from Flex."""
+        return self._ingestion.portfolio_reader.get_interest(year=year).collect()
+
+    def nav_history(self, year: int | None = None) -> pl.DataFrame:
+        """Cached daily NAV from Flex."""
+        return self._ingestion.portfolio_reader.get_nav_history(year=year).collect()
+
+    def dividend_yield(self, ticker: str) -> float | None:
+        """TTM dividend / current price (uses local prices + Flex dividends)."""
+        from datetime import date as _date, timedelta
+        ttm_start = _date.today() - timedelta(days=365)
+        df = self.dividends(ticker=ticker)
+        if df.is_empty():
+            return None
+        date_col = next((c for c in ("dateTime", "exDate", "payDate") if c in df.columns), None)
+        amt_col = next((c for c in ("amount", "netAmount", "grossAmount") if c in df.columns), None)
+        if date_col is None or amt_col is None:
+            return None
+        ttm = df.filter(pl.col(date_col) >= ttm_start)
+        total = float(ttm[amt_col].drop_nulls().sum() or 0)
+        if total <= 0:
+            return None
+        latest = self._reader.get_latest_price(ticker)
+        if latest.is_empty():
+            return None
+        # Per-share dividend yield: total $ dividends / current value of held shares.
+        # If we have the position quantity, use that; else just total / current price * 1 share.
+        pos = self._ingestion.portfolio_reader.get_positions_latest()
+        qty = 1.0
+        if not pos.is_empty():
+            row = pos.filter(pl.col("ticker") == ticker)
+            if not row.is_empty() and "quantity" in row.columns:
+                qty = float(row["quantity"][0]) or 1.0
+        price = float(latest["close"][0])
+        return round((total / qty) / price, 4)
+
+    def update_held(self, start_date: date | None = None) -> dict:
+        """OpenBB ingestion for tickers in the latest held positions snapshot.
+
+        Reads from local Parquet; call sync_holdings() first to refresh.
+        """
+        return self._ingestion.update_held_tickers(start_date)
+
+    def update_held_and_watched(self, start_date: date | None = None) -> dict:
+        """OpenBB ingestion for the union of held and watched tickers."""
+        return self._ingestion.update_held_and_watched(start_date)
+
+    def held_tickers(self) -> list[str]:
+        """Tickers in the latest IBKR positions snapshot (non-zero quantity)."""
+        return self._ingestion.portfolio_reader.list_held_tickers()
+
+    def watched_tickers(self) -> list[str]:
+        """Union of tickers across all IBKR watchlists."""
+        return self._ingestion.portfolio_reader.list_watched_tickers()
+
+    @property
+    def broker(self):
+        """Direct access to IBKRClient (lazy — constructed on first use)."""
+        return self._ingestion.broker
+
+    @property
+    def portfolio(self):
+        """PortfolioReader for direct queries against IBKR Parquet (positions, transactions, dividends)."""
+        return self._ingestion.portfolio_reader
 
     def update_prices(self, tickers: list[str] | None = None) -> dict:
         """Update only price data (incremental).

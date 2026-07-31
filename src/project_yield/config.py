@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -90,6 +90,79 @@ class Settings(BaseSettings):
     openbb_prices_validation_provider: str = Field(default="yfinance")
     openbb_fundamentals_validation_provider: str = Field(default="polygon")
 
+    # IBKR — OAuth 1.0a credentials (per ibind wiki).
+    # All seven fields below are required for ibind to call the Client Portal API.
+    ibkr_account_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ibkr_account_id", "account_id"),
+        description="Optional explicit IBKR account ID. If unset, resolved via portfolio_accounts.",
+    )
+    ibkr_oauth_consumer_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_consumer_key", "ibind_oauth1a_consumer_key", "ibkr_consumer_key"
+        ),
+        description="9-character OAuth 1.0a consumer key from IBKR registration",
+    )
+    ibkr_oauth_access_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_access_token", "ibind_oauth1a_access_token", "ibkr_access_token"
+        ),
+        description="OAuth 1.0a access token generated in IBKR portal",
+    )
+    ibkr_oauth_access_token_secret: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_access_token_secret",
+            "ibind_oauth1a_access_token_secret",
+            "ibkr_token_secret",
+        ),
+        description="OAuth 1.0a access token secret",
+    )
+    ibkr_oauth_encryption_key_fp: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_encryption_key_fp", "ibind_oauth1a_encryption_key_fp"
+        ),
+        description="Path to PEM file with the encryption private key (decrypts session token)",
+    )
+    ibkr_oauth_signature_key_fp: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_signature_key_fp", "ibind_oauth1a_signature_key_fp"
+        ),
+        description="Path to PEM file with the signature private key (signs requests)",
+    )
+    ibkr_oauth_dh_prime: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_dh_prime", "ibind_oauth1a_dh_prime"
+        ),
+        description="Diffie-Hellman prime (hex string). Optional if dh_param_fp is set.",
+    )
+    ibkr_oauth_dh_param_fp: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ibkr_oauth_dh_param_fp", "ibkr_dh_param_fp", "ibkr_dhparam_fp"
+        ),
+        description="Path to dhparam.pem; if set, dh_prime hex is extracted from it on the fly.",
+    )
+
+    # IBKR — Flex Web Service (separate from OAuth, token-based)
+    ibkr_flex_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ibkr_flex_token", "flex_token"),
+    )
+    # Per-section query IDs (use these if you have one Flex query per data type)
+    ibkr_flex_dividends_query_id: str | None = Field(default=None)
+    ibkr_flex_interest_query_id: str | None = Field(default=None)
+    ibkr_flex_nav_query_id: str | None = Field(default=None)
+    ibkr_flex_positions_query_id: str | None = Field(default=None)
+    ibkr_flex_trades_query_id: str | None = Field(default=None)
+    # Consolidated query ID (use this if you have ONE Flex query containing all sections)
+    ibkr_flex_consolidated_query_id: str | None = Field(default=None)
+
     # Data Storage
     data_path: Path = Field(default=Path("data"), description="Root path for data storage")
 
@@ -100,6 +173,21 @@ class Settings(BaseSettings):
     # Data Refresh
     default_start_date: str = Field(default="2020-01-01")
     batch_size: int = Field(default=50, ge=1, le=500)
+
+    @field_validator(
+        "openbb_fmp_api_key",
+        "openbb_polygon_api_key",
+        "ibkr_oauth_consumer_key",
+        "ibkr_oauth_access_token",
+        "ibkr_oauth_access_token_secret",
+        "ibkr_oauth_dh_prime",
+        "ibkr_flex_token",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_secret_to_str(cls, v):
+        """YAML parses unquoted all-digit values as int; SecretStr needs str."""
+        return None if v is None else str(v)
 
     @classmethod
     def settings_customise_sources(
@@ -148,6 +236,52 @@ class Settings(BaseSettings):
     def metadata_path(self) -> Path:
         """Path to metadata Parquet files."""
         return self.data_path / "metadata"
+
+    # IBKR portfolio storage paths
+    @property
+    def portfolio_path(self) -> Path:
+        """Root path for IBKR portfolio data (positions, transactions, watchlists)."""
+        return self.data_path / "portfolio"
+
+    @property
+    def positions_snapshots_path(self) -> Path:
+        """Daily snapshots of positions, partitioned by snapshot_date."""
+        return self.portfolio_path / "positions"
+
+    @property
+    def positions_latest_path(self) -> Path:
+        """Convenience single-file with the most recent positions snapshot."""
+        return self.portfolio_path / "positions_latest.parquet"
+
+    @property
+    def transactions_path(self) -> Path:
+        """All-time transactions, append + dedup on tx_id."""
+        return self.portfolio_path / "transactions.parquet"
+
+    @property
+    def watchlists_path(self) -> Path:
+        """Per-watchlist files partitioned by list_id."""
+        return self.portfolio_path / "watchlists"
+
+    @property
+    def activity_path(self) -> Path:
+        """Root path for Flex Web Service output (dividends, interest, nav_history)."""
+        return self.data_path / "activity"
+
+    @property
+    def dividends_path(self) -> Path:
+        """Dividend events, partitioned by year."""
+        return self.activity_path / "dividends"
+
+    @property
+    def interest_path(self) -> Path:
+        """Interest accruals + cash interest events, partitioned by year."""
+        return self.activity_path / "interest"
+
+    @property
+    def nav_history_path(self) -> Path:
+        """Daily NAV time series from Flex, partitioned by year."""
+        return self.activity_path / "nav_history"
 
 
 def get_settings() -> Settings:

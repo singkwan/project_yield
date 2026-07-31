@@ -219,18 +219,13 @@ class DataReader:
     def get_latest_price(self, ticker: str) -> pl.DataFrame:
         """Get the most recent price for a ticker.
 
-        Args:
-            ticker: Stock ticker symbol
-
-        Returns:
-            DataFrame with single row of latest price data
+        Returns an empty DataFrame (not a crash) when no local price data
+        exists — common for international tickers that OpenBB hasn't ingested.
         """
-        return (
-            self.get_prices(ticker=ticker)
-            .sort("date", descending=True)
-            .head(1)
-            .collect()
-        )
+        lf = self.get_prices(ticker=ticker)
+        if "date" not in lf.collect_schema().names():
+            return pl.DataFrame()
+        return lf.sort("date", descending=True).head(1).collect()
 
     def get_ttm_fundamentals(
         self,

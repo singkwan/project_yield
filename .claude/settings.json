@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(~/.claude/skills/wsl-migrate/**)",
+      "Bash(set -e)",
+      "Bash(rm -rf ~/.claude/skills/wsl-migrate)",
+      "Bash(ln -s ~/code_repos/wsl-migrate ~/.claude/skills/wsl-migrate)",
+      "Bash(~/code_repos/wsl-migrate/scripts/pack.sh -n)",
+      "Read(//home/singkwan/code_repos/wsl-migrate/**)",
+      "Bash(chmod +x scripts/plan.sh)",
+      "Bash(bash -n scripts/plan.sh)",
+      "Bash(./scripts/plan.sh)",
+      "Bash(sed -n '/## 7. Execution order/,/## 8./p' ~/.wsl-migrate/MIGRATION-PLAN.md)",
+      "Read(//etc/**)",
+      "Bash(sudo -n ls -l /etc/sudoers.d/)",
+      "Read(//etc/sudoers.d/**)",
+      "Read(//home/singkwan/.ssh/**)",
+      "Bash(grep -vE '^total|config$')"
+    ],
+    "additionalDirectories": [
+      "/home/singkwan/code_repos/wsl-migrate",
+      "/home/singkwan/code_repos/wsl-migrate/scripts"
+    ]
+  }
+}
