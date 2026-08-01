@@ -34,7 +34,9 @@ venv.bak/
 
 # uv
 .uv/
-uv.lock
+# uv.lock is intentionally TRACKED — this is an application, not a library, so the
+# exact resolved dependency set is part of the deliverable. Ignoring it is what left
+# the GreenadeV2 -> K1 migration with no way to reproduce the environment.
 
 # IDEs
 .vscode/
