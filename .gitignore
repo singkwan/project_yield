@@ -65,6 +65,10 @@ dmypy.json
 # Anchored to repo root — must NOT match src/project_yield/data/ (source code).
 /data/
 
+# Flex Web Service response cache (contains real portfolio XML)
+.flex_cache/
+/data/portfolio/.flex_cache/
+
 # Logs
 logs/*.log
 !logs/.gitkeep
@@ -79,6 +83,12 @@ logs/*.log
 .env.*.local
 config.yaml
 config.local.yaml
+
+# Secrets — IBKR OAuth keypairs and other private keys must never be committed
+additional_keys/
+secrets/
+*.pem
+*.key
 
 # OS
 .DS_Store
